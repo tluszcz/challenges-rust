@@ -7,3 +7,9 @@ Functionality:
     - Splits the downloaded file into chunks and downloads with multiple 
       connections
     - Resume the download if stopped
+
+
+What to do now... 
+
+Let's look at the code as is and look for something that is coded in a funny 
+way and try to rafactor it.

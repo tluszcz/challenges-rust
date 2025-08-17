@@ -1,8 +1,8 @@
 use reqwest::Error;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use futures_util::StreamExt;
-use tokio::join;
+use tokio::task;
 
 async fn get_file_info(url: &str) -> Result<(u64, bool), Error> {
     let client = reqwest::Client::new();
@@ -28,41 +28,45 @@ async fn get_file_info(url: &str) -> Result<(u64, bool), Error> {
     Ok((content_length, accept_range))
 }
 
-async fn download_chunks(url: &str, f_size: u64) -> Result<(), Error> {
+async fn download_chunks(url: &str, f_size: u64, chunks_num: u8) -> Result<(), Error> {
+    let ch_size: u64 = f_size / chunks_num as u64;
+    let mut ranges: Vec<String> = vec![];
 
-    let ch_size = f_size / 4;
+    for i in 1..=chunks_num {
+        if i == 1 { 
+            let r = format!("bytes=0-{}", ch_size-1);
+            ranges.push(r);
+            continue;
+        }
 
-    let range1 = format!("bytes=0-{}", ch_size-1);
-    let range2 = format!("bytes={}-{}", ch_size, (ch_size*2)-1);
-    let range3 = format!("bytes={}-{}", ch_size*2, (ch_size*3)-1);
-    let range4 = format!("bytes={}-", ch_size*3);
+        if i == chunks_num {
+            let r = format!("bytes={}-", ch_size*(chunks_num-1) as u64);
+            ranges.push(r);
+            break;
+        }
 
-    let ch_1 = reqwest::Client::new()
-                        .get(url)
-                        .header("Range", range1)
-                        .send();
-    let ch_2 = reqwest::Client::new()
-                        .get(url)
-                        .header("Range", range2)
-                        .send();
-    let ch_3 = reqwest::Client::new()
-                        .get(url)
-                        .header("Range", range3)
-                        .send();
-    let ch_4 = reqwest::Client::new()
-                        .get(url)
-                        .header("Range", range4)
-                        .send();
+        let r = format!("bytes={}-{}",
+                ch_size * (i - 1) as u64,
+                (ch_size * i as u64) - 1
+            );
+            ranges.push(r);
+    }
+
+    let mut clients = vec![];
+
+    for i in 0..chunks_num {
+        clients.push(
+            task::spawn(
+                reqwest::Client::new()
+                            .get(url)
+                            .header("Range", ranges[i as usize].clone())
+                            .send()
+            )
+        );
+    }
 
 
-    let (r1, r2, r3, r4) = join!(ch_1, ch_2, ch_3, ch_4);
-
-    let r1 = r1?;
-    let r2 = r2?;
-    let r3 = r3?;
-    let r4 = r4?;
-
-    async fn stream_to_file(r: reqwest::Response, f_name: &str) {
+    async fn stream_to_file(r: reqwest::Response, f_name: String) {
         println!("Chunk {} starting", f_name);
 
         let mut stream = r.bytes_stream();
@@ -71,32 +75,34 @@ async fn download_chunks(url: &str, f_size: u64) -> Result<(), Error> {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.unwrap();
-            eprintln!("{}", chunk.len());
             data_file.write(&*chunk).unwrap();
         }
-
-        println!("Chunk {} finished downloading", f_name);
-
     }
 
-    let d1 = stream_to_file(r1, "chunk1.data");
-    let d2 = stream_to_file(r2, "chunk2.data");
-    let d3 = stream_to_file(r3, "chunk3.data");
-    let d4 = stream_to_file(r4, "chunk4.data");
+    let mut handles = vec![];
 
-    join!(d1, d2, d3, d4);
+    for (i, c) in clients.into_iter().enumerate() {
+        let o = c.await.unwrap().unwrap();
+        handles.push(task::spawn(
+            stream_to_file(o, format!("chunk{}.data", i))
+        ));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
 
     let mut output = File::create("output").unwrap();
-    let inputs = vec![
-        "chunk1.data",
-        "chunk2.data", 
-        "chunk3.data", 
-        "chunk4.data"
-        ];
+    let mut inputs = vec![];
+    for n in 0..chunks_num {
+        inputs.push(format!("chunk{}.data", n));
+    }
 
     for i in inputs {
+        let f_name = i.clone();
         let mut input = File::open(i).unwrap();
         io::copy(&mut input, &mut output).unwrap();
+        fs::remove_file(f_name).unwrap();
     }
 
     println!("Download done!");
@@ -104,12 +110,14 @@ async fn download_chunks(url: &str, f_size: u64) -> Result<(), Error> {
     Ok(())
 }
 
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let url = "https://mirror.0xem.ma/arch/iso/2025.08.01/archlinux-x86_64.iso";
     let (size, split_ok) = get_file_info(url).await?;
     println!("File: {url} : Size: {size} bytes, Accepts ranges: {split_ok}");
 
-    download_chunks(url, size).await?;
+    let _result = download_chunks(url, size, 10).await?;
+
     Ok(())
 }
